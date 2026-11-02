@@ -1,0 +1,144 @@
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
+
+from ..audit import log
+from ..auth import current_user
+from ..authz import require
+from ..db import get_db
+from ..models import Document, Level, Permission, Role, User
+
+router = APIRouter(prefix="/documents/{doc_id}/shares", tags=["shares"])
+
+RANK = {Level.read: 1, Level.edit: 2}
+
+
+def describe(level, can_share: bool, can_download: bool) -> str:
+    """Short text for the audit log, e.g. "read,can_download"."""
+    return (getattr(level, "value", level) + (",can_share" if can_share else "")
+            + (",can_download" if can_download else ""))
+
+
+def refuse(db: Session, user: User, request: Request, doc: Document, target, status: int,
+           message: str, why: str):
+    """Record an attempt to hand out more than allowed, then answer with the error."""
+    log(db, user, "grant_refused", request, doc, target.id if target else None, detail=why[:500])
+    db.commit()
+    raise HTTPException(status, message)
+
+
+class GrantIn(BaseModel):
+    email: EmailStr
+    level: Level
+    can_share: bool = False      # only the owner may set this
+    can_download: bool = False   # delegates may only pass on what they have
+
+
+def revoke_descendants(db: Session, doc_id, user_id: int) -> list:
+    """Remove every permission handed out (directly or through others) by user_id.
+    This is what makes revoking a manager also revoke the manager's employees."""
+    removed, seen, frontier = [], {user_id}, [user_id]
+    while frontier:
+        rows = (db.query(Permission)
+                .filter(Permission.document_id == doc_id,
+                        Permission.granted_by.in_(frontier)).all())
+        frontier = []
+        for p in rows:
+            removed.append(p.user_id)
+            db.delete(p)
+            if p.user_id not in seen:
+                seen.add(p.user_id)
+                frontier.append(p.user_id)
+    return removed
+
+
+@router.post("", status_code=201)
+def grant(doc_id: uuid.UUID, body: GrantIn, request: Request,
+          user: User = Depends(current_user), db: Session = Depends(get_db)):
+    # owner, or someone the owner allowed to share (can_share)
+    doc = require(user, db.get(Document, doc_id), "share", db, request)
+    is_owner = doc.owner_id == user.id
+    mine = None if is_owner else (
+        db.query(Permission).filter_by(document_id=doc.id, user_id=user.id).one())
+
+    target = db.query(User).filter(User.email == body.email.lower()).first()
+    if (not target or target.id == user.id or target.id == doc.owner_id
+            or target.role == Role.admin):
+        raise HTTPException(400, "Cannot share with that user")
+
+    wanted = describe(body.level, body.can_share, body.can_download)
+    if not is_owner:
+        have = describe(mine.level, mine.can_share, mine.can_download)
+        if body.can_share:
+            refuse(db, user, request, doc, target, 403, "Only the owner can allow re-sharing",
+                   f"re-share right is owner-only; wanted {wanted}")
+        if RANK[body.level] > RANK[mine.level]:
+            refuse(db, user, request, doc, target, 403, "Cannot grant more than you have",
+                   f"wanted {wanted}; has {have}")
+        if body.can_download and not mine.can_download:
+            refuse(db, user, request, doc, target, 403, "Cannot grant more than you have",
+                   f"wanted {wanted}; has {have}")
+
+    perm = db.query(Permission).filter_by(document_id=doc.id, user_id=target.id).first()
+    if perm and not is_owner and perm.granted_by != user.id:
+        refuse(db, user, request, doc, target, 400, "Cannot share with that user",
+               "tried to change access the owner or someone else gave")   # not yours to change
+
+    cascaded = []
+    before = describe(perm.level, perm.can_share, perm.can_download) if perm else None
+    if perm:
+        # owner shrinking a manager's rights also shrinks what the manager handed out
+        if perm.can_share and (not body.can_share
+                               or RANK[body.level] < RANK[perm.level]
+                               or (perm.can_download and not body.can_download)):
+            cascaded = revoke_descendants(db, doc.id, target.id)
+        perm.level, perm.can_share, perm.granted_by = body.level, body.can_share, user.id
+        perm.can_download = body.can_download
+    else:
+        db.add(Permission(document_id=doc.id, user_id=target.id, level=body.level,
+                          can_share=body.can_share, can_download=body.can_download,
+                          granted_by=user.id))
+
+    if before is None:
+        detail = f"new: {wanted}"
+    elif before == wanted:
+        detail = f"unchanged: {wanted}"
+    else:
+        detail = f"changed: {before} -> {wanted}"
+    log(db, user, "grant", request, doc, target.id, detail=detail)
+    for uid in cascaded:
+        log(db, user, "revoke", request, doc, uid, detail="cascade")
+    db.commit()
+    return {"user_id": target.id, "level": body.level, "can_share": body.can_share,
+            "can_download": body.can_download}
+
+
+@router.get("")
+def list_shares(doc_id: uuid.UUID, request: Request,
+                user: User = Depends(current_user), db: Session = Depends(get_db)):
+    doc = require(user, db.get(Document, doc_id), "share", db, request)
+    q = (db.query(Permission, User.email).join(User, User.id == Permission.user_id)
+         .filter(Permission.document_id == doc.id))
+    if doc.owner_id != user.id:                 # a delegate sees only what they gave
+        q = q.filter(Permission.granted_by == user.id)
+    return [{"user_id": p.user_id, "email": e, "level": p.level,
+             "can_share": p.can_share, "can_download": p.can_download,
+             "granted_by": p.granted_by} for p, e in q.all()]
+
+
+@router.delete("/{user_id}", status_code=204)
+def revoke(doc_id: uuid.UUID, user_id: int, request: Request,
+           user: User = Depends(current_user), db: Session = Depends(get_db)):
+    doc = require(user, db.get(Document, doc_id), "share", db, request)
+    perm = db.query(Permission).filter_by(document_id=doc.id, user_id=user_id).first()
+    if not perm:
+        raise HTTPException(404, "Not found")
+    if doc.owner_id != user.id and perm.granted_by != user.id:
+        raise HTTPException(404, "Not found")   # delegates revoke only their own grants
+    cascaded = revoke_descendants(db, doc.id, perm.user_id)
+    db.delete(perm)
+    log(db, user, "revoke", request, doc, user_id)
+    for uid in cascaded:
+        log(db, user, "revoke", request, doc, uid, detail="cascade")
+    db.commit()
