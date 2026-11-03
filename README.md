@@ -17,6 +17,7 @@ TrustVault is a zero-trust document sharing platform with strict per-document pe
 2. **Deny-by-Default**: Unknown actions or unshared files result in immediate `404 Not Found` responses to prevent IDOR and enumeration.
 3. **Argon2 Password Hashing & JWT**: Industry-standard cryptographic authentication with constant-time dummy verifications against timing attacks.
 4. **Append-Only Audit Trail**: Every sensitive action and refusal is recorded.
+5. **Content-Verified File Storage**: Client MIME headers and file extensions are never trusted. Magic bytes are validated server-side, and storage names are randomized to prevent path traversal and arbitrary code execution.
 
 ## Local Setup (PowerShell)
 ```powershell
@@ -29,7 +30,14 @@ python -m app.seed
 uvicorn app.main:app --reload
 ```
 
-## Running Part 1 Tests
+## Running Tests
+
+### Day 1: Authentication Suite
 ```powershell
 pytest tests/test_auth.py -v
+```
+
+### Day 2: Upload Validation & Magic Byte Suite
+```powershell
+pytest tests/test_upload_validation.py -v
 ```
