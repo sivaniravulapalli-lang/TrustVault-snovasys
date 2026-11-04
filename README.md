@@ -41,3 +41,8 @@ pytest tests/test_auth.py -v
 ```powershell
 pytest tests/test_upload_validation.py -v
 ```
+
+### Day 3: Sharing, Access Control & Delegation Suite
+```powershell
+pytest tests/test_access.py tests/test_delegation.py tests/test_download_permission.py -v
+```

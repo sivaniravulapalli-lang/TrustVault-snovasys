@@ -68,3 +68,23 @@ This document records the prompts used, AI responses, errors caught, and securit
   - Display names are sanitized using regex (`re.sub(r"[^\w.\- ]", "_", ...)`) and pinned to the verified extension.
   - Downloads are forced with `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`.
   Verified via `tests/test_upload_validation.py`.
+
+---
+
+### Entry 5: Fine-Grained Sharing & Delegation Cascades
+- **Date:** 2026-11-04
+- **Prompt:**
+  > "Build a document delegation route in shares.py allowing users with can_share to forward document access to other users."
+- **What it produced:**
+  The AI allowed any user holding a `can_share` grant to create a new `Permission` row with whatever rights (`can_download`, `can_edit`, `can_share`) they submitted in the request payload.
+- **What was wrong with it:**
+  *Privilege Escalation & Infinite Delegation Loops.*
+  1. A user who only had read/share rights could grant edit or download permissions that they did not themselves possess.
+  2. A delegate could grant `can_share` to downstream users, creating uncontrolled multi-tier delegation chains.
+  3. If the owner revoked the original manager's access, the sub-grants granted by the manager remained active ("orphan permissions").
+- **What I did instead:**
+  1. Enforced strict bounds check: delegates cannot grant rights exceeding their own (e.g. `if want.can_download and not granter.can_download: raise 403`).
+  2. Banned re-delegation: `can_share` is hardcoded to `False` on any sub-grant (`depth = 1`).
+  3. Implemented cascading revocation: revoking a manager or stripping their `can_share` / `can_download` automatically deletes or downgrades all downstream permissions they issued.
+  4. Restricted manager visibility: delegates can only list and revoke grants they created themselves.
+  Verified via `tests/test_delegation.py` and `tests/test_download_permission.py`.
