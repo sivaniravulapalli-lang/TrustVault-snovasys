@@ -4,7 +4,7 @@ TrustVault is a zero-trust document sharing platform with strict per-document pe
 
 ## Live Deployment & Demo Accounts
 
-- **Live URL**: `https://<YOUR-RENDER-APP-NAME>.onrender.com`
+- **Live URL**: `https://trustvault-snovasys.onrender.com`
 
 | Role | Email | Password | Intended Role Scope |
 |---|---|---|---|
