@@ -88,3 +88,26 @@ This document records the prompts used, AI responses, errors caught, and securit
   3. Implemented cascading revocation: revoking a manager or stripping their `can_share` / `can_download` automatically deletes or downgrades all downstream permissions they issued.
   4. Restricted manager visibility: delegates can only list and revoke grants they created themselves.
   Verified via `tests/test_delegation.py` and `tests/test_download_permission.py`.
+
+
+---
+
+### Entry 6: Audit Trail Immutability & Search Filter Isolation
+- **Date:** 2026-11-05
+- **Prompt:**
+  > "Add document search filtering with SQL LIKE by title and category, and set up an audit event log model that deletes events when documents are removed."
+- **What it produced:**
+  The AI suggested:
+  ```python
+  query = db.query(Document).filter(Document.name.ilike(f"%{search}%"))
+  ```
+  along with `cascade="all, delete-orphan"` on the `Document.audit_logs` relationship.
+- **What was wrong with it:**
+  *Audit Log Destruction & Wildcard Information Leak.*
+  1. *Forensic Trail Destruction:* When a document is deleted, audit events must be preserved forever to prove who created, shared, or deleted it. Cascading deletion would allow a malicious actor or insider to delete a sensitive document and erase all forensic proof of their tampering.
+  2. *Global Document Discovery via Wildcards:* Searching without scoping to the caller's allowed document IDs returned documents matching the substring across the whole system. Furthermore, entering `%` or `_` acted as wildcards rather than literal characters.
+- **What I did instead:**
+  1. Made audit events strictly append-only and decoupled from document lifecycle (`ondelete="SET NULL"`). Even if a document record is purged, the audit trail preserves the document name, actor, timestamp, and action history.
+  2. Scoped all document search queries strictly through permission joins (only documents owned by or explicitly shared with the user are searchable).
+  3. Escaped SQL wildcard characters (`%`, `_`) so user queries treat them as literal characters.
+  Verified via `tests/test_audit_events.py` and `tests/test_search_filters.py`.

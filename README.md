@@ -46,3 +46,8 @@ pytest tests/test_upload_validation.py -v
 ```powershell
 pytest tests/test_access.py tests/test_delegation.py tests/test_download_permission.py -v
 ```
+
+### Day 4: Audit Logging & Secure Search Suite
+```powershell
+pytest tests/test_audit.py tests/test_audit_events.py tests/test_search.py tests/test_search_filters.py -v
+```

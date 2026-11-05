@@ -20,9 +20,14 @@ This document tracks identified attack vectors, mitigations, and test verificati
 | 14 | Orphaned Sub-Grants Upon Manager Revocation | Cascading revocation instantly removes or downgrades all downstream permissions when a delegator's access or rights are revoked. | `tests/test_delegation.py` | Closed |
 | 15 | Data Exfiltration via Unauthorized File Download | Orthogonal `can_download` permission flag enforced. Neither `can_view` (inline only) nor `can_edit` implies file download rights. | `tests/test_download_permission.py` | Closed |
 | 16 | Untrusted Admin Snoop / Data Confidentiality Breach | Content endpoints (`/documents/{id}/view`, `/download`) strictly require document owner or explicit grant. Admins cannot view or download file contents. | `tests/test_access.py`, `tests/test_download_permission.py` | Closed |
+| 17 | Audit Trail Tampering / Forensic Log Destruction | Audit logs are append-only. API exposes read-only endpoints without update/delete methods. Audit records survive document deletion via nullable references. | `tests/test_audit_events.py` | Closed |
+| 18 | Unauthorized Audit Trail Snooping | Audit routes (`/audit/events`, `/audit/stats`) strictly require `admin` role. Unauthorized users and non-admins receive immediate `403 Forbidden`. | `tests/test_audit.py` | Closed |
+| 19 | Metadata Leakage / Inadvertent Document Discovery via Search | Search queries are strictly scoped to documents owned by or explicitly shared with the caller. Wildcard characters (`%`, `_`) are escaped and taken literally. | `tests/test_search_filters.py` | Closed |
+| 20 | Information Disclosure via Category Enumeration | Categories endpoint filters dynamically based on caller visibility, ensuring strangers cannot enumerate confidential business categories. | `tests/test_search.py` | Closed |
 
-## Known Trade-offs Accepted (Day 1 – Day 3)
+## Known Trade-offs Accepted (Day 1 – Day 4)
 
 - **Stateless Tokens**: JWTs cannot be blacklisted prior to the 60-minute expiry without maintaining a centralized redis/cache layer. We compensate by verifying user status and permissions directly in the database on every document request.
 - **Synchronous Upload Validation**: Magic byte checks and DOCX zip-header parsing are executed synchronously in the request path. While this avoids background worker complexity, upload processing is bound to the worker thread for the duration of the read.
 - **Single-Tier Delegation**: Delegation is capped at 1 level deep (`can_share` cannot be re-delegated). This eliminates infinite delegation loops and complex graph traversals at the cost of multi-tier organizational forwarding.
+- **Database-Backed Audit Storage**: Audit events are persisted directly to SQLite/PostgreSQL alongside business data rather than an external SIEM/WORM drive. This optimizes deployment simplicity for the challenge scope while maintaining append-only relational constraints.
