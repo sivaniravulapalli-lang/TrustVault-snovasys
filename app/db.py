@@ -14,6 +14,15 @@ def add_missing_columns():
         if "name" not in cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(100)"))
+        if "telegram_chat_id" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN telegram_chat_id VARCHAR(50)"))
+        if "telegram_link_code" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN telegram_link_code VARCHAR(64)"))
+        if "email_alerts_enabled" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN email_alerts_enabled BOOLEAN DEFAULT 1"))
 
 
 def get_db():

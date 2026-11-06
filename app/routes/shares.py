@@ -7,7 +7,10 @@ from ..audit import log
 from ..auth import current_user
 from ..authz import require
 from ..db import get_db
+from ..email_service import notify_share_email
+from ..maintenance import check_maintenance_write_allowed
 from ..models import Document, Level, Permission, Role, User
+from ..telegram_service import notify_share
 
 router = APIRouter(prefix="/documents/{doc_id}/shares", tags=["shares"])
 
@@ -56,6 +59,7 @@ def revoke_descendants(db: Session, doc_id, user_id: int) -> list:
 @router.post("", status_code=201)
 def grant(doc_id: uuid.UUID, body: GrantIn, request: Request,
           user: User = Depends(current_user), db: Session = Depends(get_db)):
+    check_maintenance_write_allowed(user)
     # owner, or someone the owner allowed to share (can_share)
     doc = require(user, db.get(Document, doc_id), "share", db, request)
     is_owner = doc.owner_id == user.id
@@ -110,6 +114,27 @@ def grant(doc_id: uuid.UUID, body: GrantIn, request: Request,
     for uid in cascaded:
         log(db, user, "revoke", request, doc, uid, detail="cascade")
     db.commit()
+
+    # Dispatch Telegram share alerts to recipient and doc owner
+    owner = db.get(User, doc.owner_id)
+    perms_str = f"level={body.level.value}, download={'yes' if body.can_download else 'no'}, share={'yes' if body.can_share else 'no'}"
+    notify_share(
+        granter_email=user.email,
+        recipient_email=target.email,
+        doc_name=doc.name,
+        permissions=perms_str,
+        recipient_chat_id=target.telegram_chat_id,
+        owner_email=owner.email if owner else None,
+        owner_chat_id=owner.telegram_chat_id if owner else None,
+    )
+    notify_share_email(
+        granter_email=user.email,
+        recipient_email=target.email,
+        doc_name=doc.name,
+        permissions=perms_str,
+        owner_email=owner.email if owner else None,
+    )
+
     return {"user_id": target.id, "level": body.level, "can_share": body.can_share,
             "can_download": body.can_download}
 
@@ -130,6 +155,7 @@ def list_shares(doc_id: uuid.UUID, request: Request,
 @router.delete("/{user_id}", status_code=204)
 def revoke(doc_id: uuid.UUID, user_id: int, request: Request,
            user: User = Depends(current_user), db: Session = Depends(get_db)):
+    check_maintenance_write_allowed(user)
     doc = require(user, db.get(Document, doc_id), "share", db, request)
     perm = db.query(Permission).filter_by(document_id=doc.id, user_id=user_id).first()
     if not perm:

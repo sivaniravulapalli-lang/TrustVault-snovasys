@@ -40,3 +40,21 @@ LOGIN_MAX_PER_EMAIL_AND_IP = 5     # same account, same address
 LOGIN_MAX_PER_IP = 30              # one address trying many accounts
 LOGIN_MAX_PER_EMAIL = 30           # one account attacked from many addresses
 REGISTER_MAX_PER_IP_PER_HOUR = 20
+
+# Optional Telegram real-time alerts
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip()
+
+# Optional SMTP Email Alerts
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+try:
+    SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+except ValueError:
+    SMTP_PORT = 587
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.environ.get("SMTP_FROM", "").strip() or SMTP_USER or "no-reply@trustvault.local"
+
+# Optional Google Gemini AI Service
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+

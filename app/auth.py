@@ -13,7 +13,11 @@ from .config import (LOGIN_MAX_PER_EMAIL, LOGIN_MAX_PER_EMAIL_AND_IP, LOGIN_MAX_
                      REGISTER_MAX_PER_IP_PER_HOUR, SECRET_KEY, THROTTLE_WINDOW_MINUTES,
                      TOKEN_MINUTES)
 from .db import get_db
+import random
+import secrets
+from .email_service import notify_security_lockout_email, send_email_async
 from .models import AuditLog, Role, User
+from .telegram_service import notify_security_lockout
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 pwd = CryptContext(schemes=["argon2"], deprecated="auto")
@@ -99,7 +103,7 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
         raise _too_many(60)
     email = data.email.lower()
     if db.query(User).filter(User.email == email).first():
-        raise HTTPException(400, "Registration failed")
+        raise HTTPException(400, "Email already registered. Please log in or use forgot password.")
     user = User(email=email, name=data.name.strip() or None,
                 password_hash=pwd.hash(data.password), role=Role.viewer)
     db.add(user)
@@ -120,8 +124,14 @@ def _authenticate(email: str, password: str, request: Request, db: Session) -> d
         log(db, None, "login_failed", request, detail=key)
         db.commit()
         left = _attempts_left(db, request, key)
+        if left <= 0:
+            admin_users = db.query(User).filter(User.role == Role.admin).all()
+            admin_chat_ids = [u.telegram_chat_id for u in admin_users if u.telegram_chat_id]
+            admin_emails = [u.email for u in admin_users if u.email]
+            notify_security_lockout(email, _ip(request), admin_chat_ids)
+            notify_security_lockout_email(email, _ip(request), admin_emails)
         # same wording whether the e-mail or the password was wrong (no account enumeration)
-        msg = "Incorrect email or password. "
+        msg = "The email or password is incorrect. "
         msg += (f"{left} of {LOGIN_MAX_PER_EMAIL_AND_IP} attempts left." if left
                 else f"No attempts left. Try again in {THROTTLE_WINDOW_MINUTES} minutes.")
         raise HTTPException(401, msg)
@@ -141,4 +151,73 @@ def token(request: Request, form: OAuth2PasswordRequestForm = Depends(),
 
 @router.get("/me")
 def me(user: User = Depends(current_user)):
-    return {"id": user.id, "email": user.email, "role": user.role}
+    return {"id": user.id, "name": user.name, "email": user.email, "role": user.role,
+            "telegram_connected": bool(user.telegram_chat_id)}
+
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=10, max_length=128)
+
+
+@router.post("/forgot-password")
+def forgot_password(data: ForgotPasswordIn, request: Request, db: Session = Depends(get_db)):
+    email = data.email.lower()
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        # Prevent user enumeration, pretend OTP was dispatched
+        return {"message": "If this email is registered, a 6-digit OTP has been sent."}
+
+    # Generate 6-digit OTP
+    otp = f"{random.randint(100000, 999999)}"
+    user.reset_otp = otp
+    user.reset_otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+    db.commit()
+
+    # Send via Email / In-App Mailbox
+    subject = "TrustVault: Your Password Reset OTP"
+    body = (
+        f"Hello {user.name or ''},\n\n"
+        f"You requested to reset your password on TrustVault.\n\n"
+        f"Your 6-Digit Password Reset OTP is: {otp}\n\n"
+        f"This OTP is valid for 15 minutes. If you did not make this request, please ignore this email.\n\n"
+        f"— TrustVault Security"
+    )
+    send_email_async(user.email, subject, body)
+    log(db, user, "forgot_password_requested", request)
+    db.commit()
+
+    return {"message": "A 6-digit verification OTP has been sent to your email."}
+
+
+@router.post("/reset-password")
+def reset_password(data: ResetPasswordIn, request: Request, db: Session = Depends(get_db)):
+    email = data.email.lower()
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not user.reset_otp:
+        raise HTTPException(400, "Invalid reset request or expired OTP.")
+
+    # Check expiry
+    if not user.reset_otp_expires_at or datetime.now(timezone.utc) > user.reset_otp_expires_at:
+        user.reset_otp = None
+        user.reset_otp_expires_at = None
+        db.commit()
+        raise HTTPException(400, "OTP has expired. Please request a new one.")
+
+    if not secrets.compare_digest(user.reset_otp, data.otp.strip()):
+        raise HTTPException(400, "Invalid OTP code.")
+
+    # Update password and clear OTP
+    user.password_hash = pwd.hash(data.new_password)
+    user.reset_otp = None
+    user.reset_otp_expires_at = None
+    log(db, user, "password_reset_success", request)
+    db.commit()
+
+    return {"message": "Password updated successfully. You can now log in with your new password."}
+

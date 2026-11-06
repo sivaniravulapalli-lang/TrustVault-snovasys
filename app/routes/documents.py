@@ -10,17 +10,28 @@ import os
 import zipfile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session, joinedload
 
+from ..ai_service import scan_document_dlp, summarize_document
 from ..audit import log
 from ..auth import current_user, require_role
 from ..authz import require
 from ..config import MAX_UPLOAD_BYTES, UPLOAD_DIR
 from ..db import get_db
-from ..models import Document, Permission, Role, User
+from ..email_service import notify_doc_access_email
+from ..maintenance import check_maintenance_write_allowed
+from ..models import Document, Permission, Role, User, InboxMessage
+from ..telegram_service import notify_doc_access
+from ..watermark_service import (
+    generate_watermark_token,
+    format_text_stamp,
+    embed_invisible_watermark,
+    extract_invisible_watermark,
+    embed_binary_watermark
+)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -118,14 +129,65 @@ def upload(request: Request, file: UploadFile = File(...),
            category: Optional[str] = Form(None, max_length=100),
            user: User = Depends(require_role(Role.owner)),
            db: Session = Depends(get_db)):
+    check_maintenance_write_allowed(user)
     data, ext = read_validated(file)
+    
+    # Check for Multi-Hop Lineage: Did the user re-upload an edited version of an existing document?
+    parent_doc_id = None
+    lineage_trail = []
+    if ext == ".txt":
+        try:
+            text_candidate = data.decode("utf-8", errors="ignore")
+            stego = extract_invisible_watermark(text_candidate)
+            if stego and stego.get("doc_id"):
+                try:
+                    p_id = uuid.UUID(stego["doc_id"])
+                    p_doc = db.get(Document, p_id)
+                    if p_doc:
+                        parent_doc_id = p_doc.id
+                        # Fetch prior lineage or start fresh
+                        import json
+                        prior = []
+                        if p_doc.lineage_meta:
+                            try:
+                                prior = json.loads(p_doc.lineage_meta)
+                            except Exception:
+                                prior = []
+                        if not prior:
+                            prior.append({
+                                "hop": 1,
+                                "action": "created",
+                                "user_id": p_doc.owner_id,
+                                "email": p_doc.owner.email if p_doc.owner else "original_owner",
+                                "doc_name": p_doc.name,
+                                "timestamp": p_doc.created_at.isoformat() if p_doc.created_at else ""
+                            })
+                        prior.append({
+                            "hop": len(prior) + 1,
+                            "action": "re_uploaded_modified_version",
+                            "user_id": user.id,
+                            "email": user.email,
+                            "doc_name": file.filename,
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        })
+                        lineage_trail = prior
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    import json
+    lineage_str = json.dumps(lineage_trail) if lineage_trail else None
+
     doc = Document(owner_id=user.id, name=named(file.filename,ext),
                    category=category, stored_name=save_file(data, ext),
                    mime=FILE_TYPES[ext], size=len(data),
-                   sha256=hashlib.sha256(data).hexdigest())
+                   sha256=hashlib.sha256(data).hexdigest(),
+                   parent_doc_id=parent_doc_id,
+                   lineage_meta=lineage_str)
     db.add(doc)
     db.flush()
-    log(db, user, "upload", request, doc)
+    log(db, user, "upload", request, doc, detail=f"parent_doc_id={parent_doc_id}" if parent_doc_id else None)
     db.commit()
     return out(doc)
 
@@ -227,6 +289,14 @@ def view(doc_id: uuid.UUID, request: Request,
         raise HTTPException(404, "Not found")
     log(db, user, "view", request, doc)
     db.commit()
+
+    if doc.owner_id != user.id:
+        owner = db.get(User, doc.owner_id)
+        if owner:
+            if owner.telegram_chat_id:
+                notify_doc_access("view", doc.name, user.email, owner.email, owner.telegram_chat_id)
+            notify_doc_access_email("view", doc.name, user.email, owner.email)
+
     return FileResponse(path, media_type=doc.mime, filename=doc.name,
                         content_disposition_type="inline")
 
@@ -239,10 +309,118 @@ def download(doc_id: uuid.UUID, request: Request,
     path = Path(UPLOAD_DIR) / doc.stored_name
     if not path.is_file():
         raise HTTPException(404, "Not found")
-    log(db, user, "download", request, doc)
+
+    # Generate forensic watermark & tamper-evident signature
+    client_ip = request.client.host if request.client else "unknown"
+    payload_b64, sig = generate_watermark_token(
+        user_id=user.id,
+        user_email=user.email,
+        doc_id=str(doc.id),
+        doc_name=doc.name,
+        ip_address=client_ip,
+    )
+    custody_id = f"TV-{sig[:12].upper()}"
+
+    log(db, user, "download", request, doc, detail=f"custody_id={custody_id}")
     db.commit()
-    return FileResponse(path, media_type=doc.mime, filename=doc.name,
-                        content_disposition_type="attachment")
+
+    if doc.owner_id != user.id:
+        owner = db.get(User, doc.owner_id)
+        if owner:
+            if owner.telegram_chat_id:
+                notify_doc_access("download", doc.name, user.email, owner.email, owner.telegram_chat_id)
+            notify_doc_access_email("download", doc.name, user.email, owner.email)
+
+    # For text files, embed BOTH invisible steganographic payload and visible forensic footer
+    if doc.mime == "text/plain" or path.suffix.lower() in (".txt", ".md", ".log"):
+        raw_text = path.read_text(encoding="utf-8", errors="ignore")
+        # 1. Embed invisible Zero-Width tracking tag into the main document body
+        text_with_stealth = embed_invisible_watermark(raw_text, user.id, str(doc.id), sig)
+        
+        # 2. Embed visible footer
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        stamp = format_text_stamp(
+            email=user.email,
+            user_id=user.id,
+            ts=ts,
+            ip=client_ip,
+            payload_b64=payload_b64,
+            sig=sig
+        )
+        watermarked_data = (text_with_stealth + stamp).encode("utf-8")
+        headers = {
+            "Content-Disposition": f'attachment; filename="{doc.name}"',
+            "X-TrustVault-Custody-Key": custody_id,
+            "X-TrustVault-Signature": sig,
+            "X-TrustVault-Audited-User": user.email,
+        }
+        return Response(content=watermarked_data, media_type=doc.mime, headers=headers)
+
+    # For binary files (PNG, JPG), attach binary forensic trailer
+    # If it is a PDF or generic file, preserve original bytes for strict bitwise-identical verification
+    if path.suffix.lower() in (".png", ".jpg", ".jpeg"):
+        raw_bytes = path.read_bytes()
+        watermarked_bytes = embed_binary_watermark(raw_bytes, user.id, user.email, str(doc.id), sig)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{doc.name}"',
+            "X-TrustVault-Custody-Key": custody_id,
+            "X-TrustVault-Signature": sig,
+            "X-TrustVault-Audited-User": user.email,
+        }
+        return Response(content=watermarked_bytes, media_type=doc.mime, headers=headers)
+
+    # For PDF/DOCX and other binary files, embed custody headers and return FileResponse
+    response = FileResponse(path, media_type=doc.mime, filename=doc.name,
+                            content_disposition_type="attachment")
+    response.headers["X-TrustVault-Custody-Key"] = custody_id
+    response.headers["X-TrustVault-Signature"] = sig
+    response.headers["X-TrustVault-Audited-User"] = user.email
+    return response
+
+
+def _extract_text(path: Path, mime: str) -> str:
+    """Extract readable text from document without external C++ or OCR tools."""
+    if not path.is_file():
+        return ""
+    try:
+        if "text" in mime or path.suffix.lower() in (".txt", ".md", ".csv", ".json", ".log"):
+            return path.read_text(encoding="utf-8", errors="ignore")
+        if path.suffix.lower() == ".docx":
+            with zipfile.ZipFile(path) as z:
+                if "word/document.xml" in z.namelist():
+                    xml_content = z.read("word/document.xml").decode("utf-8", errors="ignore")
+                    return re.sub(r"<[^>]+>", " ", xml_content)
+        raw = path.read_bytes()
+        strings = re.findall(b"[\x20-\x7E]{4,}", raw)
+        return " ".join(s.decode("latin1", errors="ignore") for s in strings[:600])
+    except Exception:
+        return ""
+
+
+@router.post("/{doc_id}/summarize")
+def summarize(doc_id: uuid.UUID, request: Request,
+              user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """RBAC-guarded Document Summarizer: Strictly requires 'read' access."""
+    doc = require(user, load(db, doc_id), "read", db, request)
+    path = Path(UPLOAD_DIR) / doc.stored_name
+    text = _extract_text(path, doc.mime)
+    res = summarize_document(doc.name, text)
+    log(db, user, "ai_summarize", request, doc, detail=f"topics={','.join(res.get('key_topics', []))}")
+    db.commit()
+    return res
+
+
+@router.post("/{doc_id}/scan-dlp")
+def scan_dlp(doc_id: uuid.UUID, request: Request,
+             user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Data Loss Prevention (DLP) scanner: Checks for sensitive data & privacy risks."""
+    doc = require(user, load(db, doc_id), "read", db, request)
+    path = Path(UPLOAD_DIR) / doc.stored_name
+    text = _extract_text(path, doc.mime)
+    res = scan_document_dlp(doc.name, text)
+    log(db, user, "ai_dlp_scan", request, doc, detail=f"classification={res.get('classification')}")
+    db.commit()
+    return res
 
 
 class PatchIn(BaseModel):
@@ -253,6 +431,7 @@ class PatchIn(BaseModel):
 @router.patch("/{doc_id}")
 def edit_meta(doc_id: uuid.UUID, body: PatchIn, request: Request,
               user: User = Depends(current_user), db: Session = Depends(get_db)):
+    check_maintenance_write_allowed(user)
     doc = require(user, load(db, doc_id), "edit", db, request)
     changes = []
     if body.name:
@@ -272,6 +451,7 @@ def edit_meta(doc_id: uuid.UUID, body: PatchIn, request: Request,
 @router.put("/{doc_id}/content")
 def replace_content(doc_id: uuid.UUID, request: Request, file: UploadFile = File(...),
                     user: User = Depends(current_user), db: Session = Depends(get_db)):
+    check_maintenance_write_allowed(user)
     doc = require(user, load(db, doc_id), "edit", db, request)
     data, ext = read_validated(file)
     if ext != Path(doc.stored_name).suffix:
@@ -282,6 +462,37 @@ def replace_content(doc_id: uuid.UUID, request: Request, file: UploadFile = File
     doc.sha256 = hashlib.sha256(data).hexdigest()
     log(db, user, "edit", request, doc,
         detail=f"content: {old_size} B -> {doc.size} B, sha256 {old_sha[:8]} -> {doc.sha256[:8]}")
+
+    # Notify all active recipients who have permission to this document
+    recipients = db.query(Permission).filter(Permission.document_id == doc.id).all()
+    for p in recipients:
+        target_user = db.get(User, p.user_id)
+        if target_user and target_user.id != user.id:
+            db.add(InboxMessage(
+                to_email=target_user.email,
+                from_email=user.email,
+                subject=f"📄 Document Version Updated - TrustVault: {doc.name}",
+                body=(
+                    f"Notification: A new revised version has been uploaded for document '{doc.name}'.\n\n"
+                    f"• Updated By : {user.email}\n"
+                    f"• Document   : {doc.name}\n"
+                    f"• New Size   : {doc.size} bytes\n"
+                    f"• SHA-256    : {doc.sha256[:16]}...\n\n"
+                    f"Your existing access permissions remain fully active. You can view or download the latest version right now in TrustVault."
+                )
+            ))
+            if target_user.telegram_chat_id:
+                try:
+                    from ..telegram_service import send_message
+                    send_message(
+                        target_user.telegram_chat_id,
+                        f"📄 *Document Updated - TrustVault*\n\n"
+                        f"A new version of `{doc.name}` was uploaded by `{user.email}`.\n"
+                        f"Your access remains active!"
+                    )
+                except Exception:
+                    pass
+
     db.commit()
     old.unlink(missing_ok=True)
     return out(doc)
@@ -290,6 +501,7 @@ def replace_content(doc_id: uuid.UUID, request: Request, file: UploadFile = File
 @router.delete("/{doc_id}", status_code=204)
 def delete(doc_id: uuid.UUID, request: Request,
            user: User = Depends(current_user), db: Session = Depends(get_db)):
+    check_maintenance_write_allowed(user)
     doc = require(user, load(db, doc_id), "delete", db, request)
     doc.deleted_at = datetime.now(timezone.utc)
     log(db, user, "delete", request, doc)

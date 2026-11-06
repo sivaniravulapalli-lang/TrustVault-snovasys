@@ -38,6 +38,8 @@ def test_permission_changes_view(setup):
     c.get(f"/documents/{d}/download", headers=alice)      # not a permission change
     rows = c.get("/admin/permission-changes", headers=admin).json()
     assert {r["action"] for r in rows} == {"grant", "revoke"}
+    filtered = c.get("/admin/permission-changes?action=grant", headers=admin).json()
+    assert len(filtered) == 1 and filtered[0]["action"] == "grant"
     assert all(r["actor_email"] == "alice@x.com" and r["target_email"] == "bob@x.com"
                and r["document_name"] == "a.pdf" for r in rows)
 

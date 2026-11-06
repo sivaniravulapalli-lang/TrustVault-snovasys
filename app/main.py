@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,15 +9,29 @@ from fastapi.staticfiles import StaticFiles
 from . import auth
 from .config import ENABLE_DOCS, MAX_REQUEST_BYTES
 from .db import add_missing_columns, engine
+from .maintenance import get_maintenance_status, check_and_notify_scheduled_expiry
 from .models import Base
-from .routes import admin, documents, shares
+from .routes import admin, documents, mailbox, shares, telegram
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     add_missing_columns()
-    yield
+
+    async def _maintenance_monitor():
+        while True:
+            try:
+                check_and_notify_scheduled_expiry()
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
+    monitor_task = asyncio.create_task(_maintenance_monitor())
+    try:
+        yield
+    finally:
+        monitor_task.cancel()
 
 
 # /docs and /openapi.json exist only when ENABLE_DOCS=1 (your own machine)
@@ -28,12 +43,19 @@ app.include_router(auth.router)
 app.include_router(documents.router)
 app.include_router(shares.router)
 app.include_router(admin.router)
+app.include_router(telegram.router)
+app.include_router(mailbox.router)
 app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
 
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse("/ui/")
+
+
+@app.get("/maintenance/status")
+def maintenance_status():
+    return get_maintenance_status()
 
 
 def refuse_oversized(request: Request):
@@ -62,7 +84,9 @@ async def guard_and_headers(request: Request, call_next):
     resp.headers["Cache-Control"] = "no-store"
     if request.url.path.startswith("/ui"):      # the test UI: no inline or foreign scripts
         resp.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' blob:; frame-src blob:; "
+            "default-src 'self'; font-src 'self' https://fonts.gstatic.com; "
+            "style-src 'self' https://fonts.googleapis.com; "
+            "img-src 'self' blob: data:; frame-src blob:; "
             "object-src 'none'; base-uri 'none'; form-action 'self'")
     return resp
 
