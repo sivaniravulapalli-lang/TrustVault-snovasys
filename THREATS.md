@@ -1,33 +1,40 @@
-# Threat Model — TrustVault
+# TrustVault Threat Model & Mitigations
 
-This document tracks identified attack vectors, mitigations, and test verifications as the system evolves.
+This document outlines the threat vectors evaluated during the design and development of TrustVault (DocShare), their cryptographic and architectural mitigations, and the test suites that prove them.
 
-| # | Threat | Mitigation | Proven by | Status |
-|---|---|---|---|---|
-| 1 | Credential Guessing / Brute-Force | Rate limiting derived from audit logs (5 failed attempts per IP/account window), Argon2 password hashing. | `tests/test_auth.py` | Closed |
-| 2 | User Enumeration via Login Timing | Login verification executes a dummy Argon2 hash check even when the user is not found, keeping response time constant. | `tests/test_auth.py` | Closed |
-| 3 | Token Forgery / Weak Secrets | Application enforces at least 32-character high-entropy `SECRET_KEY` on startup, rejecting default/weak keys. | `tests/test_auth.py` | Closed |
-| 4 | Self-Assigned Admin/Owner Privilege at Registration | Registration endpoint binds role strictly to `viewer`; role escalation is only possible by an admin. | `tests/test_auth.py` | Closed |
-| 5 | Tampered or Expired JWT Tokens | JWT expiration pinned to 60 minutes with strict cryptographic signature verification on every protected route. | `tests/test_auth.py` | Closed |
-| 6 | Malicious File Upload via Extension Masquerading (e.g. `.exe` disguised as `.pdf`) | Deep content inspection (`sniff()`) verifies true magic bytes against whitelist (`%PDF-`, `\x89PNG`, `\xff\xd8\xff`, ZIP structure for DOCX). Rejects mismatches with `415`. | `tests/test_upload_validation.py` | Closed |
-| 7 | Client-Side MIME Confusion / Stored XSS via Content Sniffing | Client-supplied `Content-Type` is ignored; server enforces stored MIME type, adds `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`. | `tests/test_upload_validation.py` | Closed |
-| 8 | Path Traversal / Arbitrary Overwrite via Malicious Filenames (`../../evil.pdf`) | User filenames are sanitized for display only; actual storage uses random `uuid4().hex` on disk, completely isolating user paths. | `tests/test_upload_validation.py` | Closed |
-| 9 | Denial of Service via Huge Payloads or Decompression Bombs (DOCX) | Immediate hard cap at `MAX_UPLOAD_BYTES` (413), empty file rejection (400), and zip safety limit checks (max 2000 entries, 50MB decompressed). | `tests/test_upload_validation.py` | Closed |
-| 10 | Unauthorized File Upload by Viewer Role | Role-based gatekeeper rejects non-owners with `403 Forbidden` and unauthenticated requests with `401 Unauthorized`. | `tests/test_upload_validation.py` | Closed |
-| 11 | Insecure Direct Object Reference (IDOR) & Existence Enumeration | Deny-by-default architecture returns uniform `404 Not Found` for unshared or unauthorized files, preventing attackers from confirming file existence. | `tests/test_access.py` | Closed |
-| 12 | Privilege Escalation via Delegation Rights | Delegation engine checks that the delegating user cannot grant permissions exceeding their own (`can_download`, `can_edit`). | `tests/test_delegation.py` | Closed |
-| 13 | Uncontrolled / Infinite Delegation Sprawl | The `can_share` permission is strictly non-delegable. Delegates cannot forward the right to share (depth capped at 1). | `tests/test_delegation.py` | Closed |
-| 14 | Orphaned Sub-Grants Upon Manager Revocation | Cascading revocation instantly removes or downgrades all downstream permissions when a delegator's access or rights are revoked. | `tests/test_delegation.py` | Closed |
-| 15 | Data Exfiltration via Unauthorized File Download | Orthogonal `can_download` permission flag enforced. Neither `can_view` (inline only) nor `can_edit` implies file download rights. | `tests/test_download_permission.py` | Closed |
-| 16 | Untrusted Admin Snoop / Data Confidentiality Breach | Content endpoints (`/documents/{id}/view`, `/download`) strictly require document owner or explicit grant. Admins cannot view or download file contents. | `tests/test_access.py`, `tests/test_download_permission.py` | Closed |
-| 17 | Audit Trail Tampering / Forensic Log Destruction | Audit logs are append-only. API exposes read-only endpoints without update/delete methods. Audit records survive document deletion via nullable references. | `tests/test_audit_events.py` | Closed |
-| 18 | Unauthorized Audit Trail Snooping | Audit routes (`/audit/events`, `/audit/stats`) strictly require `admin` role. Unauthorized users and non-admins receive immediate `403 Forbidden`. | `tests/test_audit.py` | Closed |
-| 19 | Metadata Leakage / Inadvertent Document Discovery via Search | Search queries are strictly scoped to documents owned by or explicitly shared with the caller. Wildcard characters (`%`, `_`) are escaped and taken literally. | `tests/test_search_filters.py` | Closed |
-| 20 | Information Disclosure via Category Enumeration | Categories endpoint filters dynamically based on caller visibility, ensuring strangers cannot enumerate confidential business categories. | `tests/test_search.py` | Closed |
+---
 
-## Known Trade-offs Accepted (Day 1 – Day 4)
+## 🛡️ Threat Mitigation Matrix
 
-- **Stateless Tokens**: JWTs cannot be blacklisted prior to the 60-minute expiry without maintaining a centralized redis/cache layer. We compensate by verifying user status and permissions directly in the database on every document request.
-- **Synchronous Upload Validation**: Magic byte checks and DOCX zip-header parsing are executed synchronously in the request path. While this avoids background worker complexity, upload processing is bound to the worker thread for the duration of the read.
-- **Single-Tier Delegation**: Delegation is capped at 1 level deep (`can_share` cannot be re-delegated). This eliminates infinite delegation loops and complex graph traversals at the cost of multi-tier organizational forwarding.
-- **Database-Backed Audit Storage**: Audit events are persisted directly to SQLite/PostgreSQL alongside business data rather than an external SIEM/WORM drive. This optimizes deployment simplicity for the challenge scope while maintaining append-only relational constraints.
+| # | Threat Vector | Cryptographic & Architectural Mitigation | Proven by Test Suite |
+|---|---|---|---|
+| **1** | A user reads, downloads, edits, or deletes another user's document without authorization | Single-chokepoint `can()` and `require()` authorization engine; deny-by-default; non-existent and forbidden docs answer HTTP 404 to prevent enumeration. | `test_access.py`, `test_isolation.py` |
+| **2** | A developer introduces a new route and forgets the permission check | Dynamic route discovery reflects every `{doc_id}` route from FastAPI OpenAPI schema and executes attacks as an unauthenticated stranger, an unauthorized peer, and a revoked user. | `test_stranger_routes.py` |
+| **3** | A viewer copies document text and leaks it to external public forums | Multi-layer forensic watermarking: Visible custody header stamp + Invisible zero-width unicode steganography (`\u200B`, `\u200C`, `\u200D`) injected into the text stream. | `test_watermark.py` |
+| **4** | An attacker steals an exfiltrated snippet and claims it came from someone else | Forensic extraction console (`/admin/verify-watermark`) extracts the embedded zero-width token and matches user ID, IP address, and exact download timestamp against immutable audit records. | `test_watermark.py` |
+| **5** | A delegate hands out higher permissions than they personally possess | Delegation capping: level and download rights are strictly bounded by the granter's own held rights; `can_share` cannot be re-delegated beyond 1 step. | `test_delegation.py` |
+| **6** | A revoked user retains access via forwarded secondary shares | Recursive DAG traversal: `revoke_descendants` automatically cascades revocation down the entire sharing tree when an intermediate grant is revoked. | `test_delegation.py` |
+| **7** | A user self-assigns an escalated role (Owner or Admin) during registration | Registration API accepts only email and password; all users register as `viewer` by default; role elevation requires an Admin. | `test_auth.py`, `test_download_permission.py` |
+| **8** | An Admin exploits root access to read confidential document contents | Zero-Trust Principle: Admin role is strictly forbidden from document content access (`can()` returns False for Admin); promotion to Admin immediately revokes all previously held shares. | `test_admin_boundary.py`, `test_access.py` |
+| **9** | A deleted document remains accessible via cached URLs or disk remnants | Soft-delete status marks document as permanently denied (`deleted_at`), and file payload on disk is unlinked immediately. | `test_isolation.py`, `test_download_permission.py` |
+| **10** | Malicious file upload (extension spoofing, oversized payload, path traversal) | MIME magic byte sniffing (`sniff()`), strict allow-list (PDF, PNG, JPG, TXT, DOCX), Word package structure validation, 10 MB ceiling, and randomized UUID filenames on disk. | `test_upload_validation.py`, `test_hardening.py` |
+| **11** | Dangerous executable upload disguised as text (`run.bat` or `.exe`) | Document file extensions are strictly immutable and tied to actual content type; renaming cannot alter extension; replacing content requires identical MIME type. | `test_upload_validation.py` |
+| **12** | JWT tampering, signature forgery, or `alg: none` exploit | Cryptographic HMAC-SHA256 signature verification with minimum 32-character key requirement; algorithm pinning; user status re-validated from DB on every request. | `test_isolation.py`, `test_hardening.py` |
+| **13** | Credential stuffing and distributed password brute-forcing | Argon2id password hashing with unique salt; exponential audit-log-backed throttling (max 5 failures per account/IP within 15 mins). | `test_hardening.py` |
+| **14** | Unmonitored document tampering or silent version updates | Version replacement preserves Document UUID and lineage metadata, while automatically broadcasting update alerts to all active recipients via In-App Mailbox and Telegram. | `test_messages.py`, `test_mailbox.py` |
+| **15** | Data tampering or race conditions during server upgrade / maintenance | System Maintenance Mode: Emergency freeze or IST-scheduled maintenance window enforces read-only operations across all write endpoints (`check_maintenance_write_allowed`). | `test_maintenance.py` |
+| **16** | Scheduled maintenance window expires without resuming normal operations | Background Lifespan Monitor: Auto-clears maintenance mode upon window expiry and broadcasts completion notifications in IST to all user inboxes and Telegram. | `test_maintenance.py` |
+| **17** | Search filter manipulation to enumerate hidden documents | Permission filtering is applied at SQL level before query execution; LIKE wildcard characters (`%`, `_`) are escaped literally. | `test_search_filters.py` |
+| **18** | Insider threat exfiltrating sensitive PII (credit cards, passwords, SSNs) | Integrated DLP Scanner: Scans document contents for high-risk privacy violations before distribution. | `test_ai.py` |
+| **19** | Malicious or non-compliant document circulation requiring immediate freeze | Admin Document Suspension: Freezes document access for all users (including owner) with mandatory written justification, preserving audit trail. | `test_views_and_suspend.py` |
+| **20** | Cross-Site Scripting (XSS) via stored filenames or user metadata | Vanilla JS UI renders dynamic content strictly via `textContent` and `createElement`; strict Content-Security-Policy (CSP) headers applied. | `test_auth.py` |
+
+---
+
+## 🔍 Found While Building (and Resolved)
+
+1. **Double Timezone Shift on Naive Datetime Strings:** Browser datetime-local inputs in IST were parsed by Python as UTC and re-shifted by +5:30. Resolved with explicit IST parsing.
+2. **Naive UTC Timestamps Displaying Incorrect Client Times:** Database UTC timestamps were treated by browsers as local time (01:37 AM vs 07:07 AM IST). Resolved with ISO-8601 UTC timezone markers (`+00:00`).
+3. **Admin Could Read Previously Shared Files After Promotion:** Promotion to Admin did not clear held shares. Resolved by stripping all permissions upon role elevation to Admin.
+4. **Silent Document Version Replacements:** Viewers were unaware of content updates. Resolved by adding automatic In-App Mailbox and Telegram broadcasts upon file replacement.
+5. **Early Maintenance Reset Notifications:** Early resets failed to notify users. Resolved by dispatching rich IST completion notices when admin resets maintenance early.
