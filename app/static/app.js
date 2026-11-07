@@ -654,14 +654,95 @@ async function openDoc(d) {
 async function loadShares(d) {
   const a = d.my_access;
   const box = $("#shares");
-  const email = h("input", { type: "email", placeholder: "person's email" });
+
+  // Custom Multi-Select Dropdown with Checkboxes and "Select All"
+  const multiWrap = h("div", { class: "multiselect-dropdown-wrap" });
+  const emailInput = h("input", {
+    type: "text",
+    class: "multiselect-input-box",
+    placeholder: "Select user(s) or type emails..."
+  });
+  const panel = h("div", { class: "multiselect-panel" });
+
+  const selectAllChk = h("input", { type: "checkbox" });
+  const selectAllItem = h("label", { class: "multiselect-item multiselect-header" },
+    selectAllChk,
+    h("span", { style: "font-weight: 700; color: #38bdf8;" }, "Select All")
+  );
+  const itemsContainer = h("div", { class: "multiselect-items" });
+
+  panel.appendChild(selectAllItem);
+  panel.appendChild(itemsContainer);
+  multiWrap.appendChild(emailInput);
+  multiWrap.appendChild(panel);
+
+  const candidateBoxes = [];
+
+  const updateFromCheckboxes = () => {
+    const checked = candidateBoxes.filter(c => c.checked).map(c => c.value);
+    selectAllChk.checked = candidateBoxes.length > 0 && checked.length === candidateBoxes.length;
+    emailInput.value = checked.join(", ");
+  };
+
+  selectAllChk.onchange = () => {
+    candidateBoxes.forEach(c => { c.checked = selectAllChk.checked; });
+    updateFromCheckboxes();
+  };
+
+  try {
+    const candidates = await api(`/documents/${d.id}/shares/candidates`);
+    if (candidates && candidates.length) {
+      candidates.forEach(c => {
+        const chk = h("input", { type: "checkbox", value: c.email });
+        const item = h("label", { class: "multiselect-item" },
+          chk,
+          h("span", {}, `${c.email} (${c.name || c.email})`)
+        );
+        chk.onchange = () => updateFromCheckboxes();
+        candidateBoxes.push(chk);
+        itemsContainer.appendChild(item);
+      });
+    } else {
+      itemsContainer.appendChild(h("div", { style: "padding: 8px 14px; font-size: 12px; color: #94a3b8;" }, "No other users available."));
+    }
+  } catch (err) {}
+
+  emailInput.onclick = (e) => {
+    e.stopPropagation();
+    panel.classList.toggle("open");
+  };
+
+  emailInput.oninput = () => {
+    const typed = emailInput.value.split(/[,;\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+    candidateBoxes.forEach(c => {
+      c.checked = typed.includes(c.value.toLowerCase());
+    });
+    selectAllChk.checked = candidateBoxes.length > 0 && candidateBoxes.every(c => c.checked);
+  };
+
+  document.addEventListener("click", (e) => {
+    if (!multiWrap.contains(e.target)) {
+      panel.classList.remove("open");
+    }
+  });
+
   // a person who was given sharing rights can only hand out what they hold themselves
   const level = h("select", {}, h("option", { value: "read" }, "read"),
     a.level === "edit" ? h("option", { value: "edit" }, "edit") : null);
   const cs = h("input", { type: "checkbox" }), cd = h("input", { type: "checkbox" });
   const grant = async () => {
-    const json = { email: email.value, level: level.value, can_share: cs.checked, can_download: cd.checked };
-    if (await act(() => api(`/documents/${d.id}/shares`, { method: "POST", json }), "Access saved")) { loadShares(d); loadDocs(); }
+    const raw = emailInput.value.trim();
+    if (!raw) return;
+    const emails = raw.split(/[,;\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (!emails.length) return;
+    panel.classList.remove("open");
+    if (emails.length === 1) {
+      const json = { email: emails[0], level: level.value, can_share: cs.checked, can_download: cd.checked };
+      if (await act(() => api(`/documents/${d.id}/shares`, { method: "POST", json }), "Access saved")) { loadShares(d); loadDocs(); }
+    } else {
+      const json = { emails, level: level.value, can_share: cs.checked, can_download: cd.checked };
+      if (await act(() => api(`/documents/${d.id}/shares/batch`, { method: "POST", json }), `Batch access granted to ${emails.length} users`)) { loadShares(d); loadDocs(); }
+    }
   };
   let rows = null;                      // quiet: a 404 here just means "not yours to manage"
   try { rows = await api(`/documents/${d.id}/shares`); } catch (e) {}
@@ -673,8 +754,8 @@ async function loadShares(d) {
         } }, "Revoke")]))
       : h("p", { class: "muted", style: "margin: 4px 0 10px;" }, "You have not given access to anyone yet."))
       : h("p", { class: "muted" }, "You cannot manage sharing on this document."),
-    h("div", { class: "doc-share-box" },
-      email,
+    h("div", { class: "doc-share-box", style: "display: flex; flex-wrap: wrap; gap: 8px; align-items: center;" },
+      multiWrap,
       level,
       a.owner ? h("label", { class: "chk" }, cs, "can share") : null,
       a.can_download ? h("label", { class: "chk" }, cd, "can download") : null,
@@ -917,7 +998,7 @@ function adminView() {
           const res = await api("/admin/verify-watermark", { method: "POST", json: { token: val } });
           renderResult(res);
           loadAudit(); // Automatically refresh audit log table
-        } catch (err) {
+          } catch (err) {
           renderError(err.message);
         }
       }

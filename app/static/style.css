@@ -1048,3 +1048,66 @@ input:-webkit-autofill:active {
   border-color: #38bdf8;
   color: #f1f5f9;
 }
+
+
+/* Custom Multi-Select User Dropdown with Checkboxes & Select All */
+.multiselect-dropdown-wrap {
+  position: relative;
+  display: inline-block;
+  min-width: 280px;
+  flex: 1;
+}
+
+.multiselect-input-box {
+  width: 100%;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: calc(100% - 10px) center !important;
+  padding-right: 32px !important;
+}
+
+.multiselect-panel {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 100%;
+  min-width: 320px;
+  background: #0f172a;
+  border: 1px solid #38bdf8;
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.7), 0 0 15px rgba(56, 189, 248, 0.2);
+  z-index: 1000;
+  padding: 6px 0;
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.multiselect-panel.open {
+  display: block;
+}
+
+.multiselect-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  cursor: pointer;
+  color: #e2e8f0;
+  font-size: 13px;
+  transition: background 0.15s ease;
+  user-select: none;
+}
+
+.multiselect-item:hover {
+  background: rgba(56, 189, 248, 0.14);
+  color: #38bdf8;
+}
+
+.multiselect-header {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  font-weight: 700;
+}
