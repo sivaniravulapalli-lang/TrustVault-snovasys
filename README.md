@@ -92,6 +92,17 @@ uvicorn app.main:app --reload
 Navigate to `http://127.0.0.1:8000/` for the web UI.
 
 ---
+---
+
+## 🌐 Live Deployment
+
+**Live Application:** [SNOVASYS TRUSTVAULT](https://trustvault-snovasys.onrender.com)
+
+**Platform:** Render
+
+
+
+---
 
 ## 🧪 Comprehensive Automated Test Suite
 
