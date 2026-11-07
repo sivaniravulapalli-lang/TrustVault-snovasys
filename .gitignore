@@ -12,3 +12,5 @@ __pycache__/
 test-salary.txt
 
 *.zip
+files
+venv
